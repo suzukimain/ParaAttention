@@ -18,7 +18,8 @@ def parallelize_transformer(transformer, *args, **kwargs):
     elif transformer_cls_name.startswith("Wan"):
         adapter_name = "wan"
     else:
-        raise ValueError(f"Unknown transformer class name: {transformer_cls_name}")
+        adapter_name = "flux"
+        #raise ValueError(f"Unknown transformer class name: {transformer_cls_name}")
 
     adapter_module = importlib.import_module(f".{adapter_name}", __package__)
     parallelize_transformer_fn = getattr(adapter_module, "parallelize_transformer")
@@ -42,7 +43,8 @@ def parallelize_pipe(pipe: DiffusionPipeline, *args, **kwargs):
     elif pipe_cls_name.startswith("Wan"):
         adapter_name = "wan"
     else:
-        raise ValueError(f"Unknown pipeline class name: {pipe_cls_name}")
+        adapter_name = "flux"
+        #raise ValueError(f"Unknown pipeline class name: {pipe_cls_name}")
 
     adapter_module = importlib.import_module(f".{adapter_name}", __package__)
     parallelize_pipe_fn = getattr(adapter_module, "parallelize_pipe")
