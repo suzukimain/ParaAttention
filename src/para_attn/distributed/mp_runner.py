@@ -1,11 +1,9 @@
 import contextlib
 import os
-import pickle
 import socket
 import threading
 import time
 import traceback
-from multiprocessing.reduction import ForkingPickler
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -47,10 +45,6 @@ class MPDistRunner:
     def start_method(self):
         return "spawn"
 
-    @property
-    def max_input_size(self):
-        return 1 << 30
-
     def clone(self, *, rank=None):
         return self.__class__(rank=rank, persist_attrs={**self.persist_attrs})
 
@@ -85,9 +79,7 @@ class MPDistRunner:
         mp_ = mp.get_context(start_method)
 
         barrier = mp_.Barrier(world_size)
-        array_size = mp_.Value("q", 0, lock=False)
-        shared_array = mp_.Array("c", self.max_input_size, lock=False)
-        input_queue = mp_.JoinableQueue(maxsize=1)
+        input_queues = [mp_.JoinableQueue(maxsize=1) for _ in range(world_size)]
         output_queue = mp_.Queue(maxsize=1)
         exception_queues = [mp_.Queue(maxsize=1) for _ in range(world_size)]
         status = mp_.Value("i", 0, lock=True)
@@ -102,9 +94,7 @@ class MPDistRunner:
                         args,
                         kwargs,
                         barrier,
-                        array_size,
-                        shared_array,
-                        input_queue if rank == 0 else None,
+                        input_queues[rank],
                         output_queue if rank == 0 else None,
                         exception_queues[rank],
                         status if rank == 0 else None,
@@ -118,7 +108,7 @@ class MPDistRunner:
             begin_time = time.time()
             while True:
                 if timeout is not None and time.time() - begin_time >= timeout:
-                    raise RuntimeError("Timeout occurred")
+                    raise RuntimeError("Timeout during initialization")
                 for rank, (process, exception_queue) in enumerate(zip(processes, exception_queues)):
                     if process.is_alive():
                         if exception_queue.empty():
@@ -151,9 +141,7 @@ class MPDistRunner:
             self.terminate()
             raise
 
-        self.array_size = array_size
-        self.shared_array = shared_array
-        self.input_queue = input_queue
+        self.input_queues = input_queues
         self.output_queue = output_queue
         self.exception_queues = exception_queues
         self.status = status
@@ -163,9 +151,7 @@ class MPDistRunner:
         return self
 
     def terminate(self):
-        self.array_size = None
-        self.shared_array = None
-        self.input_queue = None
+        self.input_queues = None
         self.output_queue = None
         self.exception_queues = None
         self.status = None
@@ -207,29 +193,39 @@ class MPDistRunner:
                 if not process.is_alive():
                     raise RuntimeError(f"Process {rank} is not alive")
 
-            data = ForkingPickler.dumps((args, kwargs), pickle.HIGHEST_PROTOCOL)
-            data_size = len(data)
-            if data_size > self.max_input_size:
-                raise RuntimeError(f"Data size {data_size} exceeds maximum size {self.max_input_size}")
-            self.array_size.value = data_size
-            self.shared_array[:data_size] = data
             if timeout is not None:
                 begin_time = time.time()
-            self.input_queue.put(True, timeout=timeout)
-            self.input_queue.join()
+            for input_queue in self.input_queues:
+                input_queue.put((args, kwargs))
+            for input_queue in self.input_queues:
+                input_queue.join()
             if timeout is not None:
                 end_time = time.time()
                 duration = end_time - begin_time
-                timeout = max(0, timeout - duration)
-            output = self.output_queue.get(timeout=timeout)
-            exceptions = []
-            for rank, exception_queue in enumerate(self.exception_queues):
-                if (rank == 0 and isinstance(output, ExceptionOutput)) or not exception_queue.empty():
-                    exceptions.append((rank, exception_queue.get()))
-            if exceptions:
-                msg = "\n".join(f"Rank {rank}: {exception}" for rank, exception in exceptions)
-                raise RuntimeError(f"Exceptions occurred:\n{msg}")
-            return output
+                timeout = max(0.0, timeout - duration)
+                if timeout == 0:
+                    raise RuntimeError("Timeout during processing")
+            begin_time = time.time()
+            while True:
+                if timeout is not None and time.time() - begin_time >= timeout:
+                    raise RuntimeError("Timeout during initialization")
+                if self.output_queue.empty():
+                    for rank, process in enumerate(self.processes):
+                        if not process.is_alive():
+                            raise RuntimeError(f"Process {rank} is not alive")
+                    time.sleep(0.0)
+                    continue
+                output = self.output_queue.get()
+                exceptions = []
+                for rank, exception_queue in enumerate(self.exception_queues):
+                    if (rank == 0 and isinstance(output, ExceptionOutput)) or not exception_queue.empty():
+                        exceptions.append((rank, exception_queue.get()))
+                if exceptions:
+                    msg = "\n".join(f"Rank {rank}: {exception}" for rank, exception in exceptions)
+                    raise RuntimeError(f"Exceptions occurred:\n{msg}")
+                if isinstance(output, ExceptionOutput):
+                    raise RuntimeError("Exception occurred")
+                return output
 
     def init_process_group(self):
         if dist.is_initialized():
@@ -254,8 +250,6 @@ class MPDistRunner:
         args,
         kwargs,
         barrier,
-        array_size,
-        shared_array,
         input_queue,
         output_queue,
         exception_queue,
@@ -278,26 +272,14 @@ class MPDistRunner:
                 exception_queue.put(None)
 
             while True:
-                if input_queue is None:
-                    barrier.wait()
-                else:
-                    input_queue.get()
-                    barrier.wait()
+                input_args, input_kwargs = input_queue.get()
 
                 if status is not None:
                     with status.get_lock():
                         status.value = 1
 
-                data_size = array_size.value
-                value_bytes = shared_array[:data_size]
-
                 output = None
                 exception = None
-
-                try:
-                    input_args, input_kwargs = ForkingPickler.loads(value_bytes)
-                except Exception as e:
-                    exception = RuntimeError(f"Failed to unpickle data: {e}\n{traceback.format_exc()}")
 
                 if output_queue is not None:
                     while not output_queue.empty():
@@ -305,8 +287,7 @@ class MPDistRunner:
                 if exception_queue is not None:
                     while not exception_queue.empty():
                         exception_queue.get()
-                if input_queue is not None:
-                    input_queue.task_done()
+                input_queue.task_done()
 
                 if exception is None:
                     try:
